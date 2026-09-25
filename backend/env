@@ -1,0 +1,16 @@
+# backend/.env
+# Fill these in once PostgreSQL install finishes.
+# DB_PASSWORD is the password you set during the PostgreSQL installer.
+
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=crowd_monitor
+DB_USER=postgres
+DB_PASSWORD=XXX
+
+# Used later for login sessions (routes/auth_routes.py) — any random string is fine
+JWT_SECRET_KEY=change_this_to_a_random_string
+
+# Used later for email alerts (services/notifier.py) — optional for now
+SMTP_EMAIL=
+SMTP_PASSWORD=
