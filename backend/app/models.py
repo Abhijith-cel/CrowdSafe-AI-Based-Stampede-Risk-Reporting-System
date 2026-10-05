@@ -1,7 +1,5 @@
-# backend/app/models.py
-from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, TIMESTAMP
+from sqlalchemy import Column, Integer, String, Numeric, ForeignKey, TIMESTAMP, func
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
 from app.database import Base
 
 
@@ -37,13 +35,15 @@ class Report(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    video_path = Column(String(255), nullable=False)
+    media_path = Column(String(255), nullable=False)      # was video_path
+    media_type = Column(String(10), nullable=False, default="image")  # 'image' | 'video'
     lat = Column(Numeric(9, 6), nullable=False)
     long = Column(Numeric(9, 6), nullable=False)
-    context_tag = Column(String(30))
+    context_tag = Column(String(30))   # open_ground | narrow_lane | stairway | platform
     person_count = Column(Integer)
     density_score = Column(Numeric(6, 2))
-    risk_level = Column(String(20))
+    risk_level = Column(String(20))    # Low | Moderate | High | Critical
+    location_name = Column(String(150))  # optional; falls back to coordinates in the API
     status = Column(String(20), default="PENDING")
     submitted_at = Column(TIMESTAMP, server_default=func.now())
     processed_at = Column(TIMESTAMP)

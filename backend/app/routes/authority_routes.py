@@ -1,163 +1,105 @@
-"""Authority and security command dashboard routes."""
+"""
+Authority dashboard API.
 
-from datetime import datetime, timezone
+Serves the React dashboard (frontend/src/reportsApi.js) exactly the report
+shape it already expects:
+  { id, lat, long, risk_level, media_type, media_url, timestamp,
+    context_tag, status, person_count, location_name }
+
+Note on sessions: database.py's get_db() is a generator meant for a
+framework that calls next()/close() around a request for you (FastAPI-style
+Depends). Flask has no equivalent built in, so routes here open a
+SessionLocal() directly inside a small context manager instead — same
+engine/session factory, just consumed the way plain Flask expects.
+"""
+
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
 from flask import Blueprint, jsonify, request
-from ..database import db
-from ..models import Alert, CrowdTelemetry, Report, User, Zone
+
+from app.database import SessionLocal
+from app.models import Alert, Report
 
 authority_bp = Blueprint("authority", __name__, url_prefix="/api/authority")
 
 
-@authority_bp.route("/dashboard", methods=["GET"])
-def get_dashboard_summary():
-    """Aggregate high-level situational awareness metrics for authorities."""
-    total_zones = Zone.query.count()
-    active_alerts = Alert.query.filter_by(is_active=True).count()
-    critical_alerts = Alert.query.filter_by(is_active=True, risk_level="CRITICAL").count()
-    high_alerts = Alert.query.filter_by(is_active=True, risk_level="HIGH").count()
-    total_reports = Report.query.count()
-
-    # Recent active alerts
-    recent_alerts = (
-        Alert.query.filter_by(is_active=True)
-        .order_by(Alert.created_at.desc())
-        .limit(10)
-        .all()
-    )
-
-    # Zones with latest risk level
-    zones = Zone.query.all()
-    zone_summaries = []
-    for z in zones:
-        latest_report = (
-            Report.query.filter_by(zone_id=z.id)
-            .order_by(Report.created_at.desc())
-            .first()
-        )
-        zone_summaries.append({
-            "zone": z.to_dict(),
-            "latest_risk_level": latest_report.risk_level if latest_report else "LOW",
-            "latest_headcount": latest_report.estimated_count if latest_report else 0,
-            "latest_density": latest_report.density if latest_report else 0.0,
-            "capacity_percent": round(
-                ((latest_report.estimated_count / z.capacity_limit) * 100) if (latest_report and z.capacity_limit > 0) else 0.0,
-                1
-            ),
-        })
-
-    return jsonify({
-        "stats": {
-            "total_zones": total_zones,
-            "active_alerts": active_alerts,
-            "critical_alerts": critical_alerts,
-            "high_alerts": high_alerts,
-            "total_reports": total_reports,
-        },
-        "recent_alerts": [a.to_dict() for a in recent_alerts],
-        "zone_summaries": zone_summaries,
-    }), 200
+@contextmanager
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
-@authority_bp.route("/alerts", methods=["GET"])
-def list_alerts():
-    """List all active or historical emergency alerts."""
-    is_active_filter = request.args.get("active", "true").lower() in ("true", "1")
-    alerts = (
-        Alert.query.filter_by(is_active=is_active_filter)
-        .order_by(Alert.created_at.desc())
-        .limit(50)
-        .all()
-    )
-    return jsonify({"alerts": [a.to_dict() for a in alerts]}), 200
+def serialize_report(report: Report, host_url: str) -> dict:
+    # "new" vs "acknowledged" comes from Alert, not Report.status —
+    # Report.status ("PENDING" by default) tracks AI-pipeline progress, a
+    # separate concern from whether an authority has acknowledged it.
+    alert = report.alerts[0] if report.alerts else None
+    acknowledged = bool(alert and alert.acknowledged_at)
+
+    # Assumes media_path's filename matches a real file under
+    # backend/app/uploads/. Manually-seeded test rows need a matching real
+    # file there (or this will 404 in the browser) — this isn't enforced
+    # here since report_routes.py (the real upload writer) doesn't exist yet.
+    filename = Path(report.media_path).name if report.media_path else None
+    media_url = f"{host_url}uploads/{filename}" if filename else None
+
+    return {
+        "id": report.id,
+        "lat": float(report.lat) if report.lat is not None else None,
+        "long": float(report.long) if report.long is not None else None,
+        # Defaults to "Low" if null so the frontend's color lookup never
+        # breaks — but that means un-set test rows will silently show as
+        # Low risk. Set risk_level explicitly on every seeded row for now,
+        # since risk_classifier.py doesn't exist yet to fill this in.
+        "risk_level": report.risk_level or "Low",
+        "media_type": report.media_type,
+        "media_url": media_url,
+        "timestamp": report.submitted_at.isoformat() if report.submitted_at else None,
+        "context_tag": report.context_tag,
+        "status": "acknowledged" if acknowledged else "new",
+        "person_count": report.person_count,
+        "location_name": report.location_name or f"{report.lat}, {report.long}",
+    }
 
 
-@authority_bp.route("/alerts/<int:alert_id>/acknowledge", methods=["POST"])
-def acknowledge_alert(alert_id: int):
-    """Mark an alert as acknowledged and resolved by responding authorities."""
-    alert = Alert.query.get(alert_id)
-    if not alert:
-        return jsonify({"error": "Alert not found"}), 404
-
-    data = request.get_json() or {}
-    user_id = data.get("user_id")
-
-    alert.is_active = False
-    alert.acknowledged_by = int(user_id) if user_id and str(user_id).isdigit() else None
-    alert.acknowledged_at = datetime.now(timezone.utc)
-    db.session.commit()
-
-    return jsonify({
-        "message": f"Alert {alert_id} acknowledged and marked as resolved",
-        "alert": alert.to_dict(),
-    }), 200
+@authority_bp.route("/reports", methods=["GET"])
+def list_reports():
+    with db_session() as db:
+        reports = db.query(Report).order_by(Report.submitted_at.desc()).all()
+        data = [serialize_report(r, request.host_url) for r in reports]
+    return jsonify(data)
 
 
-@authority_bp.route("/zones", methods=["GET"])
-def list_zones():
-    """List all registered venue zones."""
-    zones = Zone.query.order_by(Zone.name.asc()).all()
-    return jsonify({"zones": [z.to_dict() for z in zones]}), 200
+@authority_bp.route("/reports/<int:report_id>/acknowledge", methods=["POST"])
+def acknowledge_report(report_id):
+    with db_session() as db:
+        report = db.query(Report).filter(Report.id == report_id).first()
+        if report is None:
+            return jsonify({"error": "Report not found"}), 404
 
+        alert = db.query(Alert).filter(Alert.report_id == report_id).first()
+        now = datetime.utcnow()
+        if alert is None:
+            # No Alert row yet — expected until geo_matcher.py exists and
+            # creates one automatically on upload. Create it here so
+            # acknowledging still works against manually-seeded reports.
+            alert = Alert(report_id=report_id, status="ACKNOWLEDGED", acknowledged_at=now)
+            db.add(alert)
+        else:
+            alert.status = "ACKNOWLEDGED"
+            alert.acknowledged_at = now
+        # acknowledged_by (a user id) is intentionally left unset: this
+        # build has no login, so there's no authenticated user to credit.
 
-@authority_bp.route("/zones", methods=["POST"])
-def create_zone():
-    """Register a new monitored zone or gate."""
-    data = request.get_json() or {}
-    zone_code = data.get("zone_code", "").strip()
-    name = data.get("name", "").strip()
-    zone_type = data.get("zone_type", "plaza").strip()
-    latitude = float(data.get("latitude", 0.0))
-    longitude = float(data.get("longitude", 0.0))
-    area_sqm = float(data.get("area_sqm", 50.0))
-    capacity_limit = int(data.get("capacity_limit", 200))
-    is_bottleneck = bool(data.get("is_bottleneck", False))
-
-    if not zone_code or not name:
-        return jsonify({"error": "zone_code and name are required"}), 400
-
-    if Zone.query.filter_by(zone_code=zone_code).first():
-        return jsonify({"error": f"Zone code '{zone_code}' already exists"}), 409
-
-    zone = Zone(
-        zone_code=zone_code,
-        name=name,
-        zone_type=zone_type,
-        latitude=latitude,
-        longitude=longitude,
-        area_sqm=area_sqm,
-        capacity_limit=capacity_limit,
-        is_bottleneck=is_bottleneck,
-    )
-    db.session.add(zone)
-    db.session.commit()
-
-    return jsonify({
-        "message": "Zone created successfully",
-        "zone": zone.to_dict(),
-    }), 201
-
-
-@authority_bp.route("/emergency-dispatch", methods=["POST"])
-def trigger_emergency_dispatch():
-    """Manual trigger to deploy marshals or open bypass gates."""
-    data = request.get_json() or {}
-    zone_id = data.get("zone_id")
-    action_type = data.get("action_type", "DISPERSAL_DIRECTIVE")  # OPEN_GATES, DISPATCH_MARSHALS
-    instruction = data.get("instruction", "Immediate crowd diversion required.")
-
-    zone = Zone.query.get(int(zone_id)) if zone_id else None
-
-    # Create emergency alert log
-    alert = Alert(
-        zone_id=zone.id if zone else 1,
-        risk_level="CRITICAL",
-        risk_score=95.0,
-        message=f"[MANUAL EMERGENCY DISPATCH - {action_type}] Zone: {zone.name if zone else 'General'} | {instruction}",
-    )
-    db.session.add(alert)
-    db.session.commit()
-
-    return jsonify({
-        "message": "Emergency dispatch command broadcasted to security teams",
-        "alert": alert.to_dict(),
-    }), 200
+        db.flush()
+        updated = serialize_report(report, request.host_url)
+    return jsonify(updated)
