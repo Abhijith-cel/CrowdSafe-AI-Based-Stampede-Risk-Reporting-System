@@ -91,9 +91,8 @@ function pinIcon(report, selected) {
   const scale = selected ? "transform: scale(1.4);" : "";
   return L.divIcon({
     className: "",
-    html: `<span style="display:block; width:22px; height:22px; border-radius:50%; background:${RISK_COLORS[report.risk_level]}; border:3px solid #0B1220; ${glow}${scale}${
-      selected ? "outline: 2px solid #3B82F6; outline-offset: 3px;" : ""
-    }"></span>`,
+    html: `<span style="display:block; width:22px; height:22px; border-radius:50%; background:${RISK_COLORS[report.risk_level]}; border:3px solid #0B1220; ${glow}${scale}${selected ? "outline: 2px solid #3B82F6; outline-offset: 3px;" : ""
+      }"></span>`,
     iconSize: [28, 28],
     iconAnchor: [14, 14],
   });
@@ -104,19 +103,28 @@ function ReportMap({ reports, selectedId, onSelect, mode }) {
   const map = useRef(null);
   const markerLayer = useRef(null);
   const heatLayer = useRef(null);
-  const fitted = useRef(false);
+  const bounds = useRef(null); // bounds around all currently shown reports
+  const userMoved = useRef(false); // true once the person pans, zooms or selects something
+
+  // Fit the view to the pins. Re-measures the map box first, because Leaflet only
+  // measures its container when it is created, and a wrong size gives a zoom that
+  // is far too wide (the whole world).
+  const fit = useCallback(() => {
+    if (!map.current || !bounds.current) return;
+    map.current.invalidateSize({ animate: false });
+    map.current.fitBounds(bounds.current, { maxZoom: 14, animate: false });
+  }, []);
 
   useEffect(() => {
-    map.current = L.map(el.current, { zoomControl: false }).setView(
-      [12.9716, 77.5946],
-      12
-    );
-    L.control.zoom({ position: "bottomleft" }).addTo(map.current);
+    const node = el.current;
+    const m = L.map(node, { zoomControl: false }).setView([12.9716, 77.5946], 12);
+    map.current = m;
+    L.control.zoom({ position: "bottomleft" }).addTo(m);
     L.tileLayer(OSM_TILES, {
       maxZoom: 19,
       attribution: TILE_ATTR,
       className: "map-tiles-dark",
-    }).addTo(map.current);
+    }).addTo(m);
 
     markerLayer.current = L.layerGroup();
     heatLayer.current = L.heatLayer([], {
@@ -131,8 +139,27 @@ function ReportMap({ reports, selectedId, onSelect, mode }) {
       },
     });
 
-    return () => map.current.remove();
-  }, []);
+    // Whenever the map box changes size (layout settling, window resize, phone
+    // rotation) re-measure it, and re-fit until the person takes control of the map.
+    const ro = new ResizeObserver(() => {
+      m.invalidateSize({ animate: false });
+      if (!userMoved.current) fit();
+    });
+    ro.observe(node);
+
+    const markMoved = () => {
+      userMoved.current = true;
+    };
+    node.addEventListener("pointerdown", markMoved);
+    node.addEventListener("wheel", markMoved, { passive: true });
+
+    return () => {
+      ro.disconnect();
+      node.removeEventListener("pointerdown", markMoved);
+      node.removeEventListener("wheel", markMoved);
+      m.remove();
+    };
+  }, [fit]);
 
   useEffect(() => {
     if (!map.current) return;
@@ -160,20 +187,20 @@ function ReportMap({ reports, selectedId, onSelect, mode }) {
       reports.map((r) => [r.lat, r.long, HEAT_WEIGHT[r.risk_level]])
     );
 
-    if (!fitted.current && reports.length) {
-      map.current.fitBounds(
-        L.latLngBounds(reports.map((r) => [r.lat, r.long])).pad(0.25)
-      );
-      fitted.current = true;
+    if (reports.length) {
+      bounds.current = L.latLngBounds(reports.map((r) => [r.lat, r.long])).pad(0.25);
+      if (!userMoved.current) fit();
     }
-  }, [reports, selectedId, onSelect]);
+  }, [reports, selectedId, onSelect, fit]);
 
   useEffect(() => {
     const r = reports.find((x) => x.id === selectedId);
-    if (r)
+    if (r) {
+      userMoved.current = true; // a selection is a deliberate move: don't snap back to the overview
       map.current.flyTo([r.lat, r.long], Math.max(map.current.getZoom(), 15), {
         duration: 0.6,
       });
+    }
   }, [selectedId]);
 
   return <div ref={el} className="absolute inset-0 z-0" />;
@@ -211,7 +238,7 @@ function TopBar({ now }) {
               <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-low"></span>
             </span>
             <span className="font-bold tracking-wider text-ink">SYSTEM ONLINE</span>
-            <span className="hidden text-muted sm:inline">| Live Feed {now}</span>
+            <span className="hidden text-slate-300 sm:inline">| Live Feed {now}</span>
           </div>
         </div>
       </div>
@@ -433,9 +460,9 @@ function IncidentDrawer({ report, onClose, onAcknowledge, busy }) {
               <div className="flex items-center gap-3">
                 <Users size={16} className="text-accent shrink-0" />
                 <div>
-                  <span className="text-slate-300">Estimated Density: </span>
+                  <span className="text-slate-300">Estimated crowd: </span>
                   <span className="font-bold text-white text-sm">
-                    {report.person_count} people
+                    about {report.person_count} people
                   </span>
                 </div>
               </div>
@@ -496,22 +523,19 @@ function FeedCard({ r, active, onClick }) {
       layout
       onClick={onClick}
       whileHover={{ y: -4, scale: 1.01 }}
-      className={`group relative flex w-72 shrink-0 flex-col gap-2.5 rounded-2xl border p-4 text-left transition-all duration-200 bg-surface shadow-md ${
-        active
-          ? "border-accent ring-2 ring-accent/50 bg-surface-hover"
-          : "border-line hover:border-line-light hover:bg-surface-hover"
-      } ${r.status === "acknowledged" ? "opacity-75" : ""} ${
-        isCritical ? "glow-critical border-critical/50" : ""
-      }`}
+      className={`group relative flex w-72 shrink-0 flex-col gap-2.5 rounded-2xl border p-4 text-left transition-all duration-200 bg-surface shadow-md ${active
+        ? "border-accent ring-2 ring-accent/50 bg-surface-hover"
+        : "border-line hover:border-line-light hover:bg-surface-hover"
+        } ${r.status === "acknowledged" ? "opacity-75" : ""} ${isCritical ? "glow-critical border-critical/50" : ""
+        }`}
     >
       <div className="flex items-center justify-between gap-2">
         <RiskBadge level={r.risk_level} />
         <span
-          className={`rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${
-            r.status === "acknowledged"
-              ? "bg-low/15 text-low border border-low/30"
-              : "bg-accent/15 text-accent border border-accent/30"
-          }`}
+          className={`rounded-md px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider ${r.status === "acknowledged"
+            ? "bg-low/15 text-low border border-low/30"
+            : "bg-accent/15 text-accent border border-accent/30"
+            }`}
         >
           {r.status === "acknowledged" ? "ACKNOWLEDGED" : "NEW"}
         </span>
@@ -745,4 +769,4 @@ export default function Dashboard() {
       </AnimatePresence>
     </div>
   );
-}
+} 

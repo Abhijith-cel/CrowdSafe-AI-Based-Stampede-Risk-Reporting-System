@@ -123,10 +123,10 @@ def submit_report():
             "risk_level": risk_label,
             "risk_score": assessment.risk_score,
             "recommendation": assessment.recommendation,
-            "people_detected": result.count,
+            "people_estimated": result.count,
             "density_per_sqm": density,
             "assumed_area_sqm": profile["area"],
             "model": result.backend,
-            "note": "Estimate from one photo using an assumed visible area; not a measurement.",
+            "note": "Head-count estimate from one photo, using an assumed visible area; not a measurement.",
         },
     }), 201
